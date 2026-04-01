@@ -6,7 +6,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap},
     Frame,
 };
-use ssmgr_shared::{PlaybackMode, Sample, DEFAULT_CATEGORIES};
+use ssmgr_shared::{PlaybackMode, Sample, ScanDir, DEFAULT_CATEGORIES};
 use std::time::Duration;
 use tracing::info;
 
@@ -18,7 +18,8 @@ pub enum InputMode {
     Normal,
     Search,
     Category,
-    Message,
+    ScanDirPath,
+    ScanDirLabel,
 }
 
 pub struct App {
@@ -38,6 +39,10 @@ pub struct App {
     pub selected_tab: usize,
     pub loading: bool,
     pub server_connected: bool,
+    pub scan_dirs: Vec<ScanDir>,
+    pub scan_dir_list_state: ListState,
+    pub scan_dir_path_input: String,
+    pub scan_dir_label_input: String,
 }
 
 impl App {
@@ -59,6 +64,10 @@ impl App {
             selected_tab: 0,
             loading: false,
             server_connected: false,
+            scan_dirs: Vec::new(),
+            scan_dir_list_state: ListState::default(),
+            scan_dir_path_input: String::new(),
+            scan_dir_label_input: String::new(),
         };
         app
     }
@@ -79,6 +88,12 @@ impl App {
                     self.set_message("Synced samples from server".to_string());
                 }
                 Err(e) => self.set_message(format!("Sync failed: {}", e)),
+            }
+            match self.api.get_scan_dirs().await {
+                Ok(dirs) => {
+                    self.scan_dirs = dirs;
+                }
+                Err(e) => self.set_message(format!("Failed to load scan dirs: {}", e)),
             }
         } else {
             self.set_message("Cannot connect to server".to_string());
@@ -112,9 +127,8 @@ impl App {
             InputMode::Normal => self.handle_normal_key(key).await,
             InputMode::Search => self.handle_search_key(key).await,
             InputMode::Category => self.handle_category_key(key).await,
-            InputMode::Message => {
-                self.input_mode = InputMode::Normal;
-            }
+            InputMode::ScanDirPath => self.handle_scan_dir_path_key(key).await,
+            InputMode::ScanDirLabel => self.handle_scan_dir_label_key(key).await,
         }
     }
 
@@ -171,14 +185,65 @@ impl App {
                 self.update_filtered_samples().await;
             }
             KeyCode::Tab => {
-                self.selected_tab = (self.selected_tab + 1) % 2;
+                self.selected_tab = (self.selected_tab + 1) % 3;
             }
-            KeyCode::Down => self.move_selection(1),
-            KeyCode::Up => self.move_selection(-1),
-            KeyCode::Char('j') => self.move_selection(1),
-            KeyCode::Char('k') => self.move_selection(-1),
+            KeyCode::Down => {
+                if self.selected_tab == 2 {
+                    self.move_scan_dir_selection(1);
+                } else {
+                    self.move_selection(1);
+                }
+            }
+            KeyCode::Up => {
+                if self.selected_tab == 2 {
+                    self.move_scan_dir_selection(-1);
+                } else {
+                    self.move_selection(-1);
+                }
+            }
+            KeyCode::Char('j') => {
+                if self.selected_tab == 2 {
+                    self.move_scan_dir_selection(1);
+                } else {
+                    self.move_selection(1);
+                }
+            }
+            KeyCode::Char('k') => {
+                if self.selected_tab == 2 {
+                    self.move_scan_dir_selection(-1);
+                } else {
+                    self.move_selection(-1);
+                }
+            }
             KeyCode::Char('1') => self.selected_tab = 0,
             KeyCode::Char('2') => self.selected_tab = 1,
+            KeyCode::Char('3') => self.selected_tab = 2,
+            KeyCode::Char('d') => {
+                if self.selected_tab == 2 {
+                    self.remove_selected_scan_dir().await;
+                }
+            }
+            KeyCode::Char('a') => {
+                if self.selected_tab == 2 {
+                    self.input_mode = InputMode::ScanDirPath;
+                    self.scan_dir_path_input.clear();
+                    self.scan_dir_label_input.clear();
+                }
+            }
+            KeyCode::Char('R') => {
+                match self.api.rescan().await {
+                    Ok(result) => {
+                        self.set_message(format!(
+                            "Rescanned: +{} ~{} -{}",
+                            result.get("added").unwrap_or(&0),
+                            result.get("updated").unwrap_or(&0),
+                            result.get("removed").unwrap_or(&0)
+                        ));
+                        self.sync_samples().await;
+                    }
+                    Err(e) => self.set_message(format!("Rescan failed: {}", e)),
+                }
+            }
             KeyCode::Char('?') => self.show_help = !self.show_help,
             _ => {}
         }
@@ -228,6 +293,83 @@ impl App {
                 self.category_input.pop();
             }
             _ => {}
+        }
+    }
+
+    async fn handle_scan_dir_path_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Enter => {
+                if !self.scan_dir_path_input.is_empty() {
+                    self.input_mode = InputMode::ScanDirLabel;
+                }
+            }
+            KeyCode::Esc => {
+                self.input_mode = InputMode::Normal;
+            }
+            KeyCode::Char(c) => self.scan_dir_path_input.push(c),
+            KeyCode::Backspace => {
+                self.scan_dir_path_input.pop();
+            }
+            _ => {}
+        }
+    }
+
+    async fn handle_scan_dir_label_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Enter => {
+                let path = self.scan_dir_path_input.clone();
+                let label = if self.scan_dir_label_input.is_empty() {
+                    std::path::Path::new(&path)
+                        .file_name()
+                        .map(|f| f.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "unnamed".to_string())
+                } else {
+                    self.scan_dir_label_input.clone()
+                };
+                match self.api.add_scan_dir(&path, &label).await {
+                    Ok(_) => {
+                        self.set_message(format!("Added scan dir: {} ({})", label, path));
+                        self.sync_samples().await;
+                    }
+                    Err(e) => self.set_message(format!("Failed: {}", e)),
+                }
+                self.input_mode = InputMode::Normal;
+            }
+            KeyCode::Esc => {
+                self.input_mode = InputMode::Normal;
+            }
+            KeyCode::Char(c) => self.scan_dir_label_input.push(c),
+            KeyCode::Backspace => {
+                self.scan_dir_label_input.pop();
+            }
+            _ => {}
+        }
+    }
+
+    fn move_scan_dir_selection(&mut self, delta: isize) {
+        if self.scan_dirs.is_empty() {
+            return;
+        }
+        let current = self.scan_dir_list_state.selected().unwrap_or(0) as isize;
+        let max = self.scan_dirs.len() as isize - 1;
+        let next = (current + delta).clamp(0, max);
+        self.scan_dir_list_state.select(Some(next as usize));
+    }
+
+    async fn remove_selected_scan_dir(&mut self) {
+        let idx = self.scan_dir_list_state.selected();
+        if let Some(idx) = idx {
+            if let Some(dir) = self.scan_dirs.get(idx) {
+                let id = dir.id.to_string();
+                let label = dir.label.clone();
+                match self.api.remove_scan_dir(&id).await {
+                    Ok(_) => {
+                        self.set_message(format!("Removed scan dir: {}", label));
+                        self.sync_samples().await;
+                    }
+                    Err(e) => self.set_message(format!("Failed: {}", e)),
+                }
+            }
         }
     }
 
@@ -288,12 +430,14 @@ impl App {
         match self.input_mode {
             InputMode::Search => self.render_search_popup(frame),
             InputMode::Category => self.render_category_popup(frame),
+            InputMode::ScanDirPath => self.render_scan_dir_path_popup(frame),
+            InputMode::ScanDirLabel => self.render_scan_dir_label_popup(frame),
             _ => {}
         }
     }
 
     fn render_header(&self, frame: &mut Frame, area: Rect) {
-        let tabs = Tabs::new(vec!["Samples", "Preview"])
+        let tabs = Tabs::new(vec!["Samples", "Preview", "Scan Dirs"])
             .block(Block::default().borders(Borders::ALL).title("ssmgr"))
             .select(self.selected_tab)
             .style(Style::default().fg(Color::White))
@@ -309,6 +453,7 @@ impl App {
         match self.selected_tab {
             0 => self.render_sample_list(frame, area),
             1 => self.render_preview(frame, area),
+            2 => self.render_scan_dirs(frame, area),
             _ => {}
         }
     }
@@ -472,6 +617,35 @@ impl App {
         }
     }
 
+    fn render_scan_dirs(&self, frame: &mut Frame, area: Rect) {
+        let items: Vec<ListItem> = self
+            .scan_dirs
+            .iter()
+            .map(|d| {
+                let text = format!("{}  {}", d.label, d.path);
+                ListItem::new(text)
+            })
+            .collect();
+
+        let title = if self.scan_dirs.is_empty() {
+            "Scan Dirs (none) [a:add d:remove R:rescan]".to_string()
+        } else {
+            format!("Scan Dirs ({}) [a:add d:remove R:rescan]", self.scan_dirs.len())
+        };
+
+        let list = List::new(items)
+            .block(Block::default().borders(Borders::ALL).title(title))
+            .highlight_style(
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("> ");
+
+        let mut list_state = self.scan_dir_list_state.clone();
+        frame.render_stateful_widget(list, area, &mut list_state);
+    }
+
     fn render_status(&self, frame: &mut Frame, area: Rect) {
         let total = self.filtered_samples.len();
         let enabled = self.filtered_samples.iter().filter(|s| s.enabled).count();
@@ -535,7 +709,7 @@ impl App {
         let message = if self.message_timer > 0 {
             &self.message
         } else {
-            "[/]search [c]category [r]resync [e]enable [space]play [l]loop [?]help [q]quit"
+            "[/]search [c]category [r]resync [e]enable [space]play [l]loop [R]rescan [?]help [q]quit"
         };
 
         let paragraph = Paragraph::new(message).style(Style::default().fg(Color::DarkGray));
@@ -554,15 +728,25 @@ impl App {
                     .add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
-            Line::from("j/k or ↑/↓ - Navigate samples"),
-            Line::from("Tab or 1/2 - Switch tabs"),
+            Line::from("j/k or ↑/↓ - Navigate samples / scan dirs"),
+            Line::from("Tab or 1/2/3 - Switch tabs (Samples/Preview/Scan Dirs)"),
             Line::from("Space - Play selected sample"),
             Line::from("e - Toggle enabled/disabled"),
             Line::from("l - Toggle loop mode"),
             Line::from("/ - Search by name"),
             Line::from("c - Add category to sample"),
             Line::from("r - Resync from server"),
+            Line::from("R - Trigger server rescan"),
             Line::from("Esc - Clear filters"),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Scan Dirs Tab:",
+                Style::default().fg(Color::Yellow),
+            )),
+            Line::from("a - Add new scan directory"),
+            Line::from("d - Remove selected scan directory"),
+            Line::from("R - Rescan all directories"),
+            Line::from(""),
             Line::from("? - Toggle this help"),
             Line::from("q - Quit"),
             Line::from(""),
@@ -606,6 +790,26 @@ impl App {
         let block = Block::default().borders(Borders::ALL).title("Category");
         let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
         frame.render_widget(paragraph, area);
+    }
+
+    fn render_scan_dir_path_popup(&self, frame: &mut Frame) {
+        let area = centered_rect(60, 3, frame.area());
+        frame.render_widget(Clear, area);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title("Add scan dir - Path (Enter for label, Esc to cancel)");
+        let input = Paragraph::new(format!("> {}_", self.scan_dir_path_input)).block(block);
+        frame.render_widget(input, area);
+    }
+
+    fn render_scan_dir_label_popup(&self, frame: &mut Frame) {
+        let area = centered_rect(60, 3, frame.area());
+        frame.render_widget(Clear, area);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title("Add scan dir - Label (Enter to confirm, Esc to cancel)");
+        let input = Paragraph::new(format!("> {}_", self.scan_dir_label_input)).block(block);
+        frame.render_widget(input, area);
     }
 }
 
