@@ -20,6 +20,7 @@ pub enum InputMode {
     Category,
     ScanDirPath,
     ScanDirLabel,
+    ServerUrl,
 }
 
 pub struct App {
@@ -43,6 +44,7 @@ pub struct App {
     pub scan_dir_list_state: ListState,
     pub scan_dir_path_input: String,
     pub scan_dir_label_input: String,
+    pub server_url_input: String,
 }
 
 impl App {
@@ -68,6 +70,7 @@ impl App {
             scan_dir_list_state: ListState::default(),
             scan_dir_path_input: String::new(),
             scan_dir_label_input: String::new(),
+            server_url_input: String::new(),
         };
         app
     }
@@ -129,6 +132,7 @@ impl App {
             InputMode::Category => self.handle_category_key(key).await,
             InputMode::ScanDirPath => self.handle_scan_dir_path_key(key).await,
             InputMode::ScanDirLabel => self.handle_scan_dir_label_key(key).await,
+            InputMode::ServerUrl => self.handle_server_url_key(key).await,
         }
     }
 
@@ -229,6 +233,11 @@ impl App {
                     self.scan_dir_path_input.clear();
                     self.scan_dir_label_input.clear();
                 }
+            }
+            KeyCode::Char('s') => {
+                self.input_mode = InputMode::ServerUrl;
+                let url = futures::executor::block_on(self.state.get_server_url());
+                self.server_url_input = url;
             }
             KeyCode::Char('R') => {
                 match self.api.rescan().await {
@@ -346,6 +355,32 @@ impl App {
         }
     }
 
+    async fn handle_server_url_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Enter => {
+                if !self.server_url_input.is_empty() {
+                    let url = self.server_url_input.clone();
+                    self.api.update_base_url(url.clone());
+                    let mut config = self.state.config.write().await;
+                    config.server_url = url.clone();
+                    drop(config);
+                    self.state.save().await;
+                    self.set_message(format!("Server URL set to: {}", url));
+                    self.sync_samples().await;
+                }
+                self.input_mode = InputMode::Normal;
+            }
+            KeyCode::Esc => {
+                self.input_mode = InputMode::Normal;
+            }
+            KeyCode::Char(c) => self.server_url_input.push(c),
+            KeyCode::Backspace => {
+                self.server_url_input.pop();
+            }
+            _ => {}
+        }
+    }
+
     fn move_scan_dir_selection(&mut self, delta: isize) {
         if self.scan_dirs.is_empty() {
             return;
@@ -432,6 +467,7 @@ impl App {
             InputMode::Category => self.render_category_popup(frame),
             InputMode::ScanDirPath => self.render_scan_dir_path_popup(frame),
             InputMode::ScanDirLabel => self.render_scan_dir_label_popup(frame),
+            InputMode::ServerUrl => self.render_server_url_popup(frame),
             _ => {}
         }
     }
@@ -709,7 +745,7 @@ impl App {
         let message = if self.message_timer > 0 {
             &self.message
         } else {
-            "[/]search [c]category [r]resync [e]enable [space]play [l]loop [R]rescan [?]help [q]quit"
+            "[/]search [c]category [s]server [r]resync [e]enable [space]play [l]loop [R]rescan [?]help [q]quit"
         };
 
         let paragraph = Paragraph::new(message).style(Style::default().fg(Color::DarkGray));
@@ -735,6 +771,7 @@ impl App {
             Line::from("l - Toggle loop mode"),
             Line::from("/ - Search by name"),
             Line::from("c - Add category to sample"),
+            Line::from("s - Change server URL"),
             Line::from("r - Resync from server"),
             Line::from("R - Trigger server rescan"),
             Line::from("Esc - Clear filters"),
@@ -809,6 +846,16 @@ impl App {
             .borders(Borders::ALL)
             .title("Add scan dir - Label (Enter to confirm, Esc to cancel)");
         let input = Paragraph::new(format!("> {}_", self.scan_dir_label_input)).block(block);
+        frame.render_widget(input, area);
+    }
+
+    fn render_server_url_popup(&self, frame: &mut Frame) {
+        let area = centered_rect(60, 3, frame.area());
+        frame.render_widget(Clear, area);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title("Set server URL (Enter to apply, Esc to cancel)");
+        let input = Paragraph::new(format!("> {}_", self.server_url_input)).block(block);
         frame.render_widget(input, area);
     }
 }
